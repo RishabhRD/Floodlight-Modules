@@ -1,9 +1,12 @@
-package net.floodlightcontroller.multi_ip_learning_switch;
+package net.floodlightcontroller.iphandler;
 
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
 import java.util.Map;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 
 import org.projectfloodlight.openflow.protocol.OFFlowRemoved;
@@ -13,6 +16,7 @@ import org.projectfloodlight.openflow.protocol.OFPacketOut;
 import org.projectfloodlight.openflow.protocol.OFType;
 import org.projectfloodlight.openflow.protocol.OFVersion;
 import org.projectfloodlight.openflow.protocol.action.OFAction;
+import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
 import org.projectfloodlight.openflow.types.ArpOpcode;
 import org.projectfloodlight.openflow.types.EthType;
@@ -26,6 +30,7 @@ import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
 import net.floodlightcontroller.core.IOFMessageListener;
 import net.floodlightcontroller.core.IOFSwitch;
+import net.floodlightcontroller.core.IListener.Command;
 import net.floodlightcontroller.core.module.FloodlightModuleContext;
 import net.floodlightcontroller.core.module.FloodlightModuleException;
 import net.floodlightcontroller.core.module.IFloodlightModule;
@@ -38,10 +43,31 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 
 	protected static Logger log = LoggerFactory.getLogger(IPHandler.class);
 	protected IFloodlightProviderService floodlightProviderService;
-	private ConcurrentHashMap<IOFSwitch, ConcurrentHashMap<IPv4Address, MacAddress>> controllerTable; // Unified ARP
-																										// table for
-																										// controller
-
+	private ConcurrentHashMap<IOFSwitch, HashMap<IPv4Address,ArrayList<NumMacPair>>> controllerDeviceTable;
+	private ConcurrentHashMap<IOFSwitch, HashMap<IPv4Address,HashMap<MacAddress,MacAddress>>> controllerMacTable;
+	private <T> T search(Iterator<T> itr,T obj) {
+		T tmp;
+		while(itr.hasNext()) {
+			tmp = itr.next();
+			if(obj.equals(tmp)) {
+				return obj;
+			}
+		}
+		return null;
+	}
+	private <T extends Comparable<T>> T min(Iterator<T> itr) {
+		T tmp = null;
+		if(itr.hasNext()) tmp = itr.next();
+		else return null;
+		T min = tmp;
+		while(itr.hasNext()) {
+			tmp = itr.next();
+			if(tmp.compareTo(min)<0) {
+				min = tmp;
+			}
+		}
+		return min;
+	}
 	@Override
 	public String getName() {
 		// TODO Auto-generated method stub
@@ -61,57 +87,28 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 	}
 
 	private Command processFlowRemovedMessage(IOFSwitch sw, OFFlowRemoved msg) {
+		
 		return Command.CONTINUE;
 	}
 
 	private Command processPacketInMessage(IOFSwitch sw, OFPacketIn pi, FloodlightContext cntx) {
-		/**
-		 * Creating new instance of ARP table for a switch if it is not registered yet
-		 */
-		ConcurrentHashMap<IPv4Address, MacAddress> switchTable = controllerTable.get(sw);
-		if (switchTable == null) {
-			log.info("Switch {} is not registered. Registering....", sw);
-			switchTable = new ConcurrentHashMap<>();
-			controllerTable.put(sw, switchTable);
+		HashMap<IPv4Address,ArrayList<NumMacPair>> deviceTable = controllerDeviceTable.get(sw);
+		if(deviceTable==null) {
+			deviceTable = new HashMap<>();
+			controllerDeviceTable.put(sw, deviceTable);
 		}
-
+		HashMap<IPv4Address,HashMap<MacAddress,MacAddress>> macTable = controllerMacTable.get(sw);
+		if(macTable==null) {
+			macTable = new HashMap<>();
+			controllerMacTable.put(sw, macTable);
+		}
 		OFPort inPort = (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort()
-				: pi.getMatch().get(MatchField.IN_PORT)); // Input Port for Incoming Packet
-
-		// Extracting Ethernet packet for maintaining ARP table.
+				: pi.getMatch().get(MatchField.IN_PORT));
 		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 		EthType type = eth.getEtherType();
-
-		/**
-		 * If Ethernet payload is an IPv4 header then we just note entry in ARP table of
-		 * corresponding switch.// Extracting
-																													// ethernet
-																													// packet
-																													// for
-																													// maintaining
-																													// arp
-																													// table.
-		 */
-		if (type.equals(EthType.IPv4)) {
-			IPv4 ip = (IPv4) eth.getPayload();
-			IPv4Address srcAddress = ip.getSourceAddress();
-			MacAddress srcMac = switchTable.get(srcAddress);
-			MacAddress srcPacketMac = eth.getSourceMACAddress();
-			if (srcMac == null) {
-				switchTable.put(srcAddress, srcPacketMac);
-			} else if (!srcMac.equals(srcPacketMac)) {
-				switchTable.remove(srcAddress);
-				switchTable.put(srcAddress, srcPacketMac);
-			}
-			return Command.CONTINUE;
-		}
-		/**
-		 * If it is an ARP packet then we do following operations:
-		 */
-		else if (type.equals(EthType.ARP)) {
+		if(type.equals(EthType.ARP)) {
 			ARP arp = (ARP) eth.getPayload();
 			short prtType = arp.getProtocolType();
-
 			/*
 			 * If it is not an IPv4 ARP packet then we ignore it.
 			 */
@@ -119,67 +116,71 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 				log.info("Not an IPv4 ARP");
 				return Command.CONTINUE;
 			}
-
-			/**
-			 * If it is an ARP reply then we use it for maintaining our ARP table and
-			 * updating it if it is outdated.
-			 */
-			if (arp.getOpCode().equals(ArpOpcode.REPLY)) {
-				IPv4Address srcIPAddress = arp.getSenderProtocolAddress();
-				MacAddress srcMacAddress = arp.getSenderHardwareAddress();
-				IPv4Address targetIPAddress = arp.getTargetProtocolAddress();
-				MacAddress targetMacAddress = arp.getSenderHardwareAddress();
-				MacAddress tmpMac = switchTable.get(srcIPAddress);
-				if (tmpMac == null) {
-					switchTable.put(srcIPAddress, srcMacAddress);
-				} else if (!tmpMac.equals(srcMacAddress)) {
-					switchTable.remove(srcIPAddress);
-					switchTable.put(srcIPAddress, srcMacAddress);
+			
+			MacAddress srcMac = arp.getSenderHardwareAddress();
+			MacAddress destMac = arp.getTargetHardwareAddress();
+			IPv4Address srcIP = arp.getSenderProtocolAddress();
+			IPv4Address destIP = arp.getTargetProtocolAddress();
+			
+			if(arp.getOpCode().equals(ArpOpcode.REQUEST)) {
+				ArrayList<NumMacPair> nummac = deviceTable.get(srcIP);
+				if(nummac==null) {
+					nummac = new ArrayList<>();
+					nummac.add(new NumMacPair(srcMac,0));
+					deviceTable.put(srcIP, nummac);
+				}else {
+					if(search(nummac.iterator(),new NumMacPair(srcMac,0))==null) {
+						nummac.add(new NumMacPair(srcMac,0));
+					}
 				}
-				tmpMac = switchTable.get(targetIPAddress);
-				if (tmpMac == null) {
-					switchTable.put(targetIPAddress, targetMacAddress);
-				} else if (!tmpMac.equals(targetMacAddress)) {
-					switchTable.remove(targetIPAddress);
-					switchTable.put(targetIPAddress, targetMacAddress);
-				}
-				return Command.CONTINUE;
-			}
-
-			/**
-			 * If it is an ARP request then its source MAC and source IP part would help us
-			 * to maintain our ARP table. For target IP address we check if its entry is
-			 * there in ARP table. If entry is there then we send an ARP reply from
-			 * controller itself and stop the processing of the packet here only(as no one
-			 * should get duplicate ARP reply) Otherwise we do not disturb the packet and
-			 * continue its processing.
-			 */
-			else if (arp.getOpCode().equals(ArpOpcode.REQUEST)) {
-				// Maintaining ARP table
-				IPv4Address srcIPAddress = arp.getSenderProtocolAddress();
-				MacAddress srcMacAddress = arp.getSenderHardwareAddress();
-				IPv4Address targetIPAddress = arp.getTargetProtocolAddress();
-				MacAddress tmpMac = switchTable.get(srcIPAddress);
-				if (tmpMac == null) {
-					switchTable.put(srcIPAddress, srcMacAddress);
-				} else if (!srcMacAddress.equals(tmpMac)) {
-					switchTable.remove(srcIPAddress);
-					switchTable.put(srcIPAddress, srcMacAddress);
-				}
-
-				// If entry not found continue (our learning switch will broadcast it)
-				MacAddress replyMac = switchTable.get(targetIPAddress);
-				if (replyMac == null) {
-					return Command.CONTINUE;
-				}
-
-				// Create an ARP reply and send to required host
-				else {
-					log.info("Creating pseudo-ARP reply");
+				HashMap<MacAddress,MacAddress> macPair = macTable.get(destIP);
+				if(macPair==null||(!macPair.containsKey(srcMac))) {
+					nummac = deviceTable.get(destIP);
+					if(nummac!=null&&nummac.size()!=0) {
+						NumMacPair pair  = min(nummac.iterator());
+						pair.increment();
+						nummac.remove(pair);
+						nummac.add(pair);
+						MacAddress arpMac = pair.getMac();
+						Ethernet repEth = new Ethernet();
+						repEth.setDestinationMACAddress(srcMac);
+						repEth.setEtherType(EthType.ARP);
+						repEth.setSourceMACAddress(arpMac);
+						repEth.setVlanID(eth.getVlanID());
+						ARP repArp = new ARP();
+						repArp.setHardwareType(arp.getHardwareType());
+						repArp.setProtocolType(arp.getProtocolType());
+						repArp.setHardwareAddressLength(arp.getHardwareAddressLength());
+						repArp.setProtocolAddressLength(arp.getProtocolAddressLength());
+						repArp.setOpCode(ArpOpcode.REPLY);
+						repArp.setSenderHardwareAddress(arpMac);
+						repArp.setSenderProtocolAddress(destIP);
+						repArp.setTargetHardwareAddress(srcMac);
+						repArp.setTargetProtocolAddress(srcIP);
+						repEth.setPayload(repArp);
+						byte[] data = repEth.serialize();
+						OFPacketOut po = sw.getOFFactory().buildPacketOut().setData(data)
+								.setActions(Collections
+										.singletonList((OFAction) sw.getOFFactory().actions().output(inPort, 0xffFFffFF)))
+								.setInPort(OFPort.CONTROLLER).build();
+						
+						sw.write(po);
+						boolean nullBool = false;
+						if(macPair==null) {
+							macPair = new HashMap<>();
+							nullBool = true;
+						}
+						macPair.put(srcMac, arpMac);
+						if(nullBool)
+						macTable.put(destIP, macPair);
+						return Command.STOP;
+					}
+				}else {
+					MacAddress arpMac = macPair.get(srcMac);
 					Ethernet repEth = new Ethernet();
-					repEth.setDestinationMACAddress(srcMacAddress);
+					repEth.setDestinationMACAddress(srcMac);
 					repEth.setEtherType(EthType.ARP);
-					repEth.setSourceMACAddress(replyMac);
+					repEth.setSourceMACAddress(arpMac);
 					repEth.setVlanID(eth.getVlanID());
 					ARP repArp = new ARP();
 					repArp.setHardwareType(arp.getHardwareType());
@@ -187,23 +188,63 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 					repArp.setHardwareAddressLength(arp.getHardwareAddressLength());
 					repArp.setProtocolAddressLength(arp.getProtocolAddressLength());
 					repArp.setOpCode(ArpOpcode.REPLY);
-					repArp.setSenderHardwareAddress(replyMac);
-					repArp.setSenderProtocolAddress(targetIPAddress);
-					repArp.setTargetHardwareAddress(srcMacAddress);
-					repArp.setTargetProtocolAddress(srcIPAddress);
+					repArp.setSenderHardwareAddress(arpMac);
+					repArp.setSenderProtocolAddress(destIP);
+					repArp.setTargetHardwareAddress(srcMac);
+					repArp.setTargetProtocolAddress(srcIP);
 					repEth.setPayload(repArp);
 					byte[] data = repEth.serialize();
 					OFPacketOut po = sw.getOFFactory().buildPacketOut().setData(data)
 							.setActions(Collections
 									.singletonList((OFAction) sw.getOFFactory().actions().output(inPort, 0xffFFffFF)))
 							.setInPort(OFPort.CONTROLLER).build();
-
+					
 					sw.write(po);
 					return Command.STOP;
 				}
-
 			}
-
+			else if(arp.getOpCode().equals(ArpOpcode.REPLY)) {
+				ArrayList<NumMacPair> macPair = deviceTable.get(srcIP);
+				if(macPair==null||(search(macPair.iterator(),new NumMacPair(srcMac,0))==null)) {
+					boolean b = false;
+					if(macPair == null) {
+						macPair = new ArrayList<>();
+						b = true;
+					}
+					macPair.add(new NumMacPair(srcMac,0));
+					if(b) {
+						deviceTable.put(srcIP,macPair);
+					}
+				}
+				macPair = deviceTable.get(destIP);
+				if(macPair==null||search(macPair.iterator(),new NumMacPair(srcMac,0))==null) {
+					boolean b = false;
+					if(macPair==null) {
+						macPair = new ArrayList<>();
+						b = true;
+					}
+					macPair.add(new NumMacPair(destMac,1));
+					if(b) deviceTable.put(destIP,macPair);
+				}else {
+					Iterator<NumMacPair> itr = macPair.iterator();
+					NumMacPair pair = search(itr,new NumMacPair(destMac,0));
+					macPair.remove(pair);
+					pair.increment();
+					macPair.add(pair);
+				}
+				HashMap<MacAddress,MacAddress> entryTable = macTable.get(destIP);
+				if(entryTable==null||!entryTable.containsKey(srcMac)) {
+					boolean b = false;
+					if(entryTable==null) {
+						entryTable = new HashMap<>();
+						b = true;
+					}
+					entryTable.put(srcMac, destMac);
+					if(b) {
+						macTable.put(destIP,entryTable);
+					}
+				}
+			}
 		}
 		return Command.CONTINUE;
 	}
@@ -250,7 +291,8 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 		// TODO Auto-generated method stub
 		log.info("IPHandler Learning switch Starting....");
 		floodlightProviderService = context.getServiceImpl(IFloodlightProviderService.class);
-		controllerTable = new ConcurrentHashMap<>();
+		controllerDeviceTable = new ConcurrentHashMap<>();
+		controllerMacTable = new ConcurrentHashMap<>();
 	}
 
 	@Override
@@ -259,6 +301,12 @@ public class IPHandler implements IFloodlightModule, IOFMessageListener {
 		floodlightProviderService.addOFMessageListener(OFType.PACKET_IN, this);
 		floodlightProviderService.addOFMessageListener(OFType.FLOW_REMOVED, this);
 		floodlightProviderService.addOFMessageListener(OFType.ERROR, this);
+		ArrayList<NumMacPair> set = new ArrayList<>();
+		MacAddress mac1 = MacAddress.of("00:00:00:00:00:01");
+		set.add(new NumMacPair(mac1,1));
+		if(search(set.iterator(),new NumMacPair(mac1,0))!=null)
+		log.info("Yes, I am doing right");
+		else log.info("No, I am doing wrong");
 	}
 
 }
