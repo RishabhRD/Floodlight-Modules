@@ -154,10 +154,6 @@ public class MultiIPLearningSwitch implements IFloodlightModule, IOFMessageListe
 		mb.setExact(MatchField.IN_PORT, inPort).setExact(MatchField.ETH_SRC, srcMac).setExact(MatchField.ETH_DST,
 				dstMac);
 
-		if (!vlan.equals(VlanVid.ZERO)) {
-			mb.setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlanVid(vlan));
-		}
-
 		return mb.build();
 	}
 
